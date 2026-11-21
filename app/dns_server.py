@@ -9,8 +9,8 @@ import dns.exception
 import dns.flags
 import dns.message
 import dns.opcode
-import dns.rdataclass
 import dns.rcode
+import dns.rdataclass
 
 from .zone import ZoneRenderer
 
@@ -21,7 +21,6 @@ EDNS_PAYLOAD = 1232
 
 def build_response(renderer: ZoneRenderer, query: dns.message.Message) -> dns.message.Message:
     resp = dns.message.make_response(query, our_payload=EDNS_PAYLOAD)
-    resp.flags |= dns.flags.AA
     if query.opcode() != dns.opcode.QUERY:
         resp.set_rcode(dns.rcode.NOTIMP)
         return resp
@@ -33,6 +32,11 @@ def build_response(renderer: ZoneRenderer, query: dns.message.Message) -> dns.me
         resp.set_rcode(dns.rcode.REFUSED)
         return resp
     rcode, answers, authority = renderer.lookup(q.name, q.rdtype)
+    # AA only when we actually answered for our own zone.  Out-of-zone
+    # queries are REFUSED with empty answer/authority/additional sections,
+    # so nothing about the zone leaks.
+    if renderer.is_authoritative(q.name):
+        resp.flags |= dns.flags.AA
     resp.set_rcode(rcode)
     resp.answer.extend(answers)
     resp.authority.extend(authority)
@@ -42,7 +46,7 @@ def build_response(renderer: ZoneRenderer, query: dns.message.Message) -> dns.me
 class _UDPHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         data, sock = self.request
-        server: "_ThreadedUDPServer" = self.server  # type: ignore[assignment]
+        server: _ThreadedUDPServer = self.server  # type: ignore[assignment]
         try:
             query = dns.message.from_wire(data)
         except Exception:

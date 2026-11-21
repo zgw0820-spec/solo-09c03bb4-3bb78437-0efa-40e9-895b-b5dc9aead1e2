@@ -13,9 +13,16 @@ Two cache-safety waits are enforced, both anchored at the last moment the
   * /rotate/switch is refused until t_publish + DNSKEY_TTL, because a resolver
     may still hold a DNSKEY answer that does not contain ZSK2 (a new A record
     signed by ZSK2 would not validate against it).
-  * /rotate/retire is refused until t_switch + A_TTL, because a resolver may
-    still hold an A answer carrying the ZSK1 signature (it would not validate
-    once ZSK1 disappears from the DNSKEY set).
+  * /rotate/retire is refused until t_switch + max(A_TTL, SOA_TTL), because a
+    resolver may still hold an answer carrying the ZSK1 signature -- A records,
+    and also the SOA/NSEC material in negative answers -- which would not
+    validate once ZSK1 disappears from the DNSKEY set.
+
+Negative answers are signed too: NXDOMAIN carries NSEC proofs that QNAME and
+the relevant wildcard do not exist, NODATA carries the NSEC for the queried
+owner name.  Every RRset in a response is signed by the phase's signing ZSK
+(DNSKEY by the KSK), from one state snapshot, so an answer never mixes
+signatures or proofs from different rotation phases.
 
 Failed operations never touch the state, so DNS answers stay exactly as they
 were.  Repeating an already-successful operation is a no-op and, in
@@ -23,6 +30,7 @@ particular, does NOT restart any timer.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import threading
@@ -31,21 +39,22 @@ from dataclasses import dataclass
 
 import dns.dnssec
 import dns.name
-import dns.rdataclass
-import dns.rdata
 import dns.rcode
-import dns.rrset
+import dns.rdata
+import dns.rdataclass
 import dns.rdatatype
+import dns.rrset
+from dns.rdtypes.ANY.NSEC import NSEC, Bitmap
 
 from .config import Settings
 from .keys import KeyPair, KeyRing
 
 log = logging.getLogger("dnssec-demo.zone")
 
-PHASE_INITIAL = "initial"  # ZSK1 published, ZSK1 signs A
-PHASE_PUBLISHED = "published"  # ZSK1+ZSK2 published, ZSK1 signs A
-PHASE_SWITCHED = "switched"  # ZSK1+ZSK2 published, ZSK2 signs A
-PHASE_RETIRED = "retired"  # ZSK2 published, ZSK2 signs A
+PHASE_INITIAL = "initial"  # ZSK1 published, ZSK1 signs A/SOA/NSEC
+PHASE_PUBLISHED = "published"  # ZSK1+ZSK2 published, ZSK1 signs A/SOA/NSEC
+PHASE_SWITCHED = "switched"  # ZSK1+ZSK2 published, ZSK2 signs A/SOA/NSEC
+PHASE_RETIRED = "retired"  # ZSK2 published, ZSK2 signs A/SOA/NSEC
 
 SOA_SERIAL = 2026112101
 
@@ -54,7 +63,8 @@ class RotationState:
     """Rotation phase plus the two wall-clock anchors (all times epoch secs).
 
     t_publish: last moment a DNSKEY answer *without* ZSK2 could have been sent.
-    t_switch:  last moment an A answer signed with ZSK1 could have been sent.
+    t_switch:  last moment an answer signed by ZSK1 could have been sent
+               (A, SOA and NSEC all carry the signing ZSK's signature).
     """
 
     def __init__(self, settings: Settings, keyring: KeyRing):
@@ -79,6 +89,15 @@ class RotationState:
             return self.keyring.zsk1
         return self.keyring.zsk2
 
+    def _signing_zsk_ttl_locked(self) -> int:
+        """Longest TTL of any RRset signed by the current signing ZSK.
+
+        The ZSK signs A as well as the negative-answer material (SOA and
+        NSEC), so the retire wait must outlive every cached answer carrying
+        an old-ZSK signature, not just the A RRset.
+        """
+        return max(self.settings.a_ttl, self.settings.soa_ttl)
+
     @dataclass(frozen=True)
     class View:
         """Consistent snapshot used to render one DNS answer."""
@@ -87,7 +106,7 @@ class RotationState:
         published_zsks: tuple[KeyPair, ...]
         signing_zsk: KeyPair
 
-    def view(self) -> "RotationState.View":
+    def view(self) -> RotationState.View:
         with self._lock:
             return RotationState.View(
                 phase=self._phase,
@@ -104,7 +123,7 @@ class RotationState:
                 else None
             )
             retire_not_before = (
-                self._t_switch + self.settings.a_ttl
+                self._t_switch + self._signing_zsk_ttl_locked()
                 if self._t_switch is not None
                 else None
             )
@@ -129,6 +148,7 @@ class RotationState:
                 },
                 "dnskey_ttl": self.settings.dnskey_ttl,
                 "a_ttl": self.settings.a_ttl,
+                "soa_ttl": self.settings.soa_ttl,
                 "timers": {
                     "t_publish": self._t_publish,
                     "t_switch": self._t_switch,
@@ -195,18 +215,19 @@ class RotationState:
                 )
             self._phase = PHASE_SWITCHED
             self._t_switch = now
+            signing_ttl = self._signing_zsk_ttl_locked()
             log.info(
-                "SWITCH: A record now signed by ZSK2 (tag %d); retire allowed in %ds",
+                "SWITCH: A/SOA/NSEC now signed by ZSK2 (tag %d); retire allowed in %ds",
                 self.keyring.zsk2.key_tag,
-                self.settings.a_ttl,
+                signing_ttl,
             )
             return self._ok(
                 "switch",
                 changed=True,
                 message=(
-                    f"A record now signed by ZSK2 (key tag {self.keyring.zsk2.key_tag}); "
-                    f"/rotate/retire allowed after t_switch + A TTL "
-                    f"({self.settings.a_ttl}s)"
+                    f"A/SOA/NSEC now signed by ZSK2 (key tag "
+                    f"{self.keyring.zsk2.key_tag}); /rotate/retire allowed after "
+                    f"t_switch + max(A TTL, SOA TTL) ({signing_ttl}s)"
                 ),
             )
 
@@ -223,16 +244,16 @@ class RotationState:
                 return self._conflict(
                     "retire",
                     "invalid_order",
-                    "old ZSK still signs the A record; call /rotate/switch first",
+                    "old ZSK still signs the A/SOA/NSEC data; call /rotate/switch first",
                 )
-            not_before = self._t_switch + self.settings.a_ttl
+            not_before = self._t_switch + self._signing_zsk_ttl_locked()
             now = time.time()
             if now < not_before:
                 return self._conflict(
                     "retire",
                     "too_early",
-                    "waiting for cached A answers carrying the old ZSK signature to "
-                    "expire (t_switch + A TTL); state unchanged",
+                    "waiting for cached A/SOA/NSEC answers carrying the old ZSK "
+                    "signature to expire (t_switch + signing TTL); state unchanged",
                     remaining=math.ceil(not_before - now),
                     not_before=not_before,
                 )
@@ -293,7 +314,22 @@ def _remaining(not_before: float | None, now: float) -> int | None:
 
 
 class ZoneRenderer:
-    """Builds signed RRsets for the zone from the current rotation state."""
+    """Builds signed RRsets for the zone from the current rotation state.
+
+    The zone is unsigned in memory; every answer is signed on the fly with
+    the *current* signing ZSK, so a proof can never carry a stale signature
+    from an earlier rotation phase.  The zone also carries a full NSEC chain
+    (one NSEC per authoritative owner name, in canonical order) used for
+    authenticated denial of existence:
+
+      * NXDOMAIN: NSEC(s) covering the queried name and the wildcard that
+        could have synthesised it (RFC 4035 section 3.1.3.2);
+      * NODATA:   the NSEC that exactly matches the queried owner name,
+        whose type bitmap lists the types that do exist (section 3.1.3.1).
+
+    NSEC RRsets use the SOA MINIMUM TTL (RFC 4035 section 2.3) and are
+    signed by the same ZSK that signs the SOA/A data.
+    """
 
     def __init__(self, settings: Settings, keyring: KeyRing, state: RotationState):
         self.settings = settings
@@ -301,6 +337,11 @@ class ZoneRenderer:
         self.state = state
         self.apex = dns.name.from_text(settings.apex)
         self.app_name = dns.name.from_text(settings.app_fqdn)
+        if b"*" in self.app_name.labels:
+            raise ValueError(
+                "APP_LABEL must not contain a wildcard label: this zone has no "
+                "wildcard synthesis, and denial proofs assume that"
+            )
         self.a_rdata = dns.rdata.from_text(
             dns.rdataclass.IN, dns.rdatatype.A, settings.a_value
         )
@@ -310,6 +351,29 @@ class ZoneRenderer:
             f"ns1.{settings.apex} hostmaster.{settings.apex} "
             f"{SOA_SERIAL} 7200 3600 1209600 {settings.soa_ttl}",
         )
+
+        # Authoritative RRsets at each owner name (unsigned).  DNSKEY is
+        # rendered per query because its contents depend on the phase.
+        self._zone: dict[dns.name.Name, set[int]] = {
+            self.apex: {dns.rdatatype.SOA, dns.rdatatype.DNSKEY},
+            self.app_name: {dns.rdatatype.A},
+        }
+        self._owner_names: list[dns.name.Name] = sorted(self._zone)
+        self._owner_set = set(self._owner_names)
+        # Names that exist in the zone tree for closest-encloser purposes:
+        # every owner name plus every ancestor up to the apex (empty
+        # non-terminals).  ENTs get no NSEC of their own (RFC 4035 2.3) but a
+        # query for one is answered in the Name Error form (RFC 4035 3.1.3.2).
+        existing: set[dns.name.Name] = set()
+        for owner in self._owner_names:
+            name = owner
+            while name.is_subdomain(self.apex):
+                existing.add(name)
+                if name == self.apex:
+                    break
+                name = name.parent()
+        self._existing_names = existing
+        self._nsec_rrsets = self._build_nsec_chain()
 
     # ---------------------------------------------------------------- signing
 
@@ -324,6 +388,9 @@ class ZoneRenderer:
             expiration=now + self.settings.sig_lifetime,
         )
         return dns.rrset.from_rdata(rrset.name, rrset.ttl, rrsig)
+
+    def _signed(self, rrset: dns.rrset.RRset, key: KeyPair) -> list[dns.rrset.RRset]:
+        return [rrset, self._sign(rrset, key)]
 
     def _soa_rrset(self) -> dns.rrset.RRset:
         rr = dns.rrset.RRset(self.apex, dns.rdataclass.IN, dns.rdatatype.SOA)
@@ -345,33 +412,121 @@ class ZoneRenderer:
         rr.add(self.a_rdata)
         return rr
 
+    # ------------------------------------------------------------- NSEC chain
+
+    def _build_nsec_chain(self) -> dict[dns.name.Name, dns.rrset.RRset]:
+        """One NSEC per authoritative owner name, chained in canonical order.
+
+        The last NSEC points back at the apex (RFC 4034 section 4.1.1).  The
+        type bitmap always lists the types that actually exist at the owner
+        plus NSEC and RRSIG, which is mandatory (RFC 4035 section 2.3).
+        """
+        chain: dict[dns.name.Name, dns.rrset.RRset] = {}
+        for i, owner in enumerate(self._owner_names):
+            nxt = self._owner_names[(i + 1) % len(self._owner_names)]
+            types = set(self._zone[owner]) | {
+                dns.rdatatype.NSEC,
+                dns.rdatatype.RRSIG,
+            }
+            nsec = NSEC(
+                dns.rdataclass.IN,
+                dns.rdatatype.NSEC,
+                nxt,
+                Bitmap.from_rdtypes(sorted(types)),
+            )
+            rr = dns.rrset.from_rdata(owner, self.settings.soa_ttl, nsec)
+            chain[owner] = rr
+        return chain
+
+    def _nsec_rrsets_at(self, name: dns.name.Name) -> dns.rrset.RRset:
+        return self._nsec_rrsets[name]
+
+    def _covering_nsec(self, name: dns.name.Name) -> dns.rrset.RRset:
+        """NSEC whose canonical interval contains *name* (which must not exist).
+
+        With a sorted owner-name list, the predecessor of the insertion point
+        owns that interval; the chain wraps from the last name back to apex.
+        """
+        idx = bisect.bisect_left(self._owner_names, name)
+        pred = self._owner_names[(idx - 1) % len(self._owner_names)]
+        return self._nsec_rrsets[pred]
+
     # ---------------------------------------------------------------- lookups
 
+    def is_authoritative(self, qname: dns.name.Name) -> bool:
+        """True if *qname* is inside the zone this renderer is authoritative for."""
+        return qname.is_subdomain(self.apex)
+
+    def _all_signed_rrsets_at(
+        self, name: dns.name.Name, view: RotationState.View
+    ) -> list[list[dns.rrset.RRset]]:
+        """Every authoritative RRset at *name*, each followed by its RRSIG(s)."""
+        groups: list[list[dns.rrset.RRset]] = []
+        if name == self.apex:
+            groups.append(self._signed(self._soa_rrset(), view.signing_zsk))
+            groups.append(self._signed(self._dnskey_rrset(view), self.keyring.ksk))
+            groups.append(self._signed(self._nsec_rrsets_at(name), view.signing_zsk))
+        elif name == self.app_name:
+            groups.append(self._signed(self._a_rrset(), view.signing_zsk))
+            groups.append(self._signed(self._nsec_rrsets_at(name), view.signing_zsk))
+        return groups
+
     def lookup(self, qname: dns.name.Name, qtype: int):
-        """Return (rcode, answer_rrsets, authority_rrsets) for a query."""
+        """Return (rcode, answer_rrsets, authority_rrsets) for a query.
+
+        One state snapshot is taken up front, so a single answer is always
+        rendered from one rotation phase (no old/new proof mixing).
+        """
         view = self.state.view()
-        refused = (dns.rcode.REFUSED, [], [])
+
+        # Outside the zone: refuse, and leak nothing (no SOA, no NSEC).
         if not qname.is_subdomain(self.apex):
-            return refused
+            return dns.rcode.REFUSED, [], []
 
-        soa = self._soa_rrset()
-        soa_signed = [soa, self._sign(soa, view.signing_zsk)]
+        groups = self._all_signed_rrsets_at(qname, view) if qname in self._owner_set else []
+        if groups:
+            if qtype == dns.rdatatype.ANY:
+                return dns.rcode.NOERROR, [rr for g in groups for rr in g], []
+            if qtype == dns.rdatatype.RRSIG:
+                # One RRSIG per covered RRset; RFC 4034 section 3 allows their
+                # TTLs to differ when the covered RRsets' TTLs differ.
+                return dns.rcode.NOERROR, [g[1] for g in groups], []
+            for group in groups:
+                if group[0].rdtype == qtype:
+                    return dns.rcode.NOERROR, list(group), []
+            # Known name, absent type: NODATA, proven by the matching NSEC.
+            authority = self._negative_authority(view, [qname])
+            return dns.rcode.NOERROR, [], authority
 
-        if qname not in (self.apex, self.app_name):
-            return dns.rcode.NXDOMAIN, [], soa_signed
+        # Name does not exist.  RFC 4035 section 3.1.3.2 needs an NSEC that
+        # covers QNAME and an NSEC that covers the wildcard at the closest
+        # encloser (often the same NSEC, which is then sent only once).
+        closest = self._closest_encloser(qname)
+        wildcard = dns.name.Name((b"*",)) + closest
+        proof_owners = [self._covering_nsec(qname).name]
+        if wildcard not in self._owner_set:
+            wc_owner = self._covering_nsec(wildcard).name
+            if wc_owner not in proof_owners:
+                proof_owners.append(wc_owner)
+        authority = self._negative_authority(view, proof_owners)
+        return dns.rcode.NXDOMAIN, [], authority
 
-        answers: list[dns.rrset.RRset] = []
-        if qname == self.apex:
-            if qtype in (dns.rdatatype.SOA, dns.rdatatype.ANY):
-                answers += soa_signed
-            if qtype in (dns.rdatatype.DNSKEY, dns.rdatatype.ANY):
-                dnskey = self._dnskey_rrset(view)
-                answers += [dnskey, self._sign(dnskey, self.keyring.ksk)]
-        elif qtype in (dns.rdatatype.A, dns.rdatatype.ANY):
-            a = self._a_rrset()
-            answers += [a, self._sign(a, view.signing_zsk)]
+    def _closest_encloser(self, qname: dns.name.Name) -> dns.name.Name:
+        """Longest existing ancestor of *qname* (the apex always exists)."""
+        name = qname
+        while name not in self._existing_names:
+            if name == self.apex:
+                return self.apex
+            name = name.parent()
+        return name
 
-        if answers:
-            return dns.rcode.NOERROR, answers, []
-        # Known name, unknown type: NODATA.
-        return dns.rcode.NOERROR, [], soa_signed
+    def _negative_authority(
+        self, view: RotationState.View, nsec_owners: list[dns.name.Name]
+    ) -> list[dns.rrset.RRset]:
+        """Signed SOA plus the signed NSEC RRset(s) for a negative answer."""
+        authority: list[dns.rrset.RRset] = self._signed(
+            self._soa_rrset(), view.signing_zsk
+        )
+        for owner in nsec_owners:
+            authority.extend(self._signed(self._nsec_rrsets_at(owner), view.signing_zsk))
+        return authority
