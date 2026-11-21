@@ -1,0 +1,17 @@
+name: dnssec-rotation-demo
+
+services:
+  dnssec-demo:
+    build: .
+    image: dnssec-rotation-demo:local
+    ports:
+      - "5353:5353/udp" # authoritative DNS (dnspython)
+      - "8000:8000/tcp" # FastAPI + Swagger UI (http://127.0.0.1:8000/docs)
+    environment:
+      ZONE_NAME: example.test
+      APP_LABEL: app
+      A_VALUE: 192.0.2.10
+      A_TTL: "30"
+      DNSKEY_TTL: "30"
+      DNS_PORT: "5353"
+    restart: unless-stopped
